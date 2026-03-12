@@ -166,7 +166,8 @@ def send_briefing():
     try:
         result = subprocess.run(
             [sys.executable, report_script, "--type", "brief"],
-            capture_output=True, text=True, timeout=30
+            capture_output=True, text=True, timeout=90,
+            encoding="utf-8", errors="replace"
         )
         content = result.stdout
     except Exception as e:
