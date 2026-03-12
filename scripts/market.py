@@ -27,10 +27,17 @@ BINANCE_BASES = [
 ]
 
 
+def _make_opener():
+    # Use direct connection; TUN-mode VPN routes traffic at OS level
+    return urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+_opener = _make_opener()
+
+
 def fetch_url(url: str) -> dict:
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "BinanceSentinel/1.0"})
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with _opener.open(req, timeout=15) as resp:
             return json.loads(resp.read().decode())
     except Exception as e:
         return {"error": str(e)}

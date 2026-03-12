@@ -17,9 +17,16 @@ if sys.platform == "win32":
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 
-BSCSCAN_API_KEY = os.environ.get("BSCSCAN_API_KEY", "YourApiKeyToken")
-BSCSCAN_BASE = "https://api.bscscan.com/api"
+BSC_RPC = "https://bsc-rpc.publicnode.com"
+SOURCIFY_BASE = "https://sourcify.dev/server"
 UTC8 = timezone(timedelta(hours=8))
+
+
+def _make_opener():
+    # Use direct connection; TUN-mode VPN routes traffic at OS level
+    return urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+_opener = _make_opener()
 
 # Risk keyword patterns in contract source code
 HIGH_RISK_PATTERNS = [
@@ -47,45 +54,108 @@ MEDIUM_RISK_PATTERNS = [
 def fetch_url(url: str) -> dict:
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "BinanceSentinel/1.0"})
-        with urllib.request.urlopen(req, timeout=15) as resp:
+        with _opener.open(req, timeout=15) as resp:
             return json.loads(resp.read().decode())
     except Exception as e:
         return {"error": str(e), "status": "0"}
 
 
+def rpc_call(method: str, params: list) -> dict:
+    payload = json.dumps({"jsonrpc": "2.0", "method": method, "params": params, "id": 1}).encode()
+    req = urllib.request.Request(
+        BSC_RPC, data=payload,
+        headers={"Content-Type": "application/json", "User-Agent": "BinanceSentinel/1.0"}
+    )
+    try:
+        with _opener.open(req, timeout=15) as resp:
+            return json.loads(resp.read().decode())
+    except Exception as e:
+        return {"error": str(e)}
+
+
 def get_contract_info(address: str) -> dict:
-    """Fetch contract source code and verification status"""
-    url = (f"{BSCSCAN_BASE}?module=contract&action=getsourcecode"
-           f"&address={address}&apikey={BSCSCAN_API_KEY}")
-    return fetch_url(url)
+    """Check contract verification via Sourcify, fall back to bytecode check"""
+    # Check Sourcify for verified source
+    check_url = f"{SOURCIFY_BASE}/check-by-addresses?addresses={address}&chainIds=56"
+    check = fetch_url(check_url)
+    if isinstance(check, list) and check:
+        entry = check[0]
+        status = entry.get("status", "false")
+        if status in ("perfect", "partial"):
+            # Fetch actual source files
+            files_url = f"{SOURCIFY_BASE}/files/any/56/{address}"
+            files = fetch_url(files_url)
+            source = ""
+            if isinstance(files, dict) and "files" in files:
+                for f in files["files"]:
+                    if f.get("name", "").endswith(".sol"):
+                        source += f.get("content", "")
+            return {"status": "1", "result": [{"SourceCode": source,
+                                                "ContractName": entry.get("name", "Verified"),
+                                                "CompilerVersion": ""}]}
+    # Not verified - check if contract (has bytecode)
+    code = rpc_call("eth_getCode", [address, "latest"])
+    bytecode = code.get("result", "0x")
+    if bytecode and bytecode != "0x":
+        return {"status": "1", "result": [{"SourceCode": "", "ContractName": "Unverified", "CompilerVersion": ""}]}
+    return {"status": "0", "result": []}
 
 
 def get_token_info(address: str) -> dict:
-    """Fetch token metadata"""
-    url = (f"{BSCSCAN_BASE}?module=token&action=tokeninfo"
-           f"&contractaddress={address}&apikey={BSCSCAN_API_KEY}")
-    return fetch_url(url)
+    """Fetch token metadata via ERC-20 eth_call"""
+    def call(sig_hex):
+        r = rpc_call("eth_call", [{"to": address, "data": sig_hex}, "latest"])
+        return r.get("result", "0x")
+
+    def decode_string(hex_val):
+        try:
+            raw = bytes.fromhex(hex_val[2:])
+            # ABI string: offset(32) + length(32) + data
+            if len(raw) >= 64:
+                length = int.from_bytes(raw[32:64], "big")
+                return raw[64:64+length].decode("utf-8", errors="replace").strip("\x00")
+        except Exception:
+            pass
+        return "Unknown"
+
+    name   = decode_string(call("0x06fdde03"))  # name()
+    symbol = decode_string(call("0x95d89b41"))  # symbol()
+    supply_hex = call("0x18160ddd")             # totalSupply()
+    try:
+        total_supply = str(int(supply_hex, 16))
+    except Exception:
+        total_supply = "Unknown"
+
+    return {"status": "1", "result": [{"tokenName": name, "symbol": symbol,
+                                        "totalSupply": total_supply, "holdersCount": "0"}]}
 
 
 def get_contract_txcount(address: str) -> int:
-    """Get transaction count for address"""
-    url = (f"{BSCSCAN_BASE}?module=proxy&action=eth_getTransactionCount"
-           f"&address={address}&tag=latest&apikey={BSCSCAN_API_KEY}")
-    data = fetch_url(url)
+    """Estimate recent activity via Transfer event count in last ~6000 blocks (~5h)"""
+    TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+    block_data = rpc_call("eth_blockNumber", [])
     try:
-        return int(data.get("result", "0x0"), 16)
+        latest = int(block_data.get("result", "0x0"), 16)
     except (ValueError, TypeError):
         return 0
+    from_block = latest - 6000
+    logs = rpc_call("eth_getLogs", [{
+        "fromBlock": hex(from_block),
+        "toBlock": "latest",
+        "address": address,
+        "topics": [TRANSFER_TOPIC]
+    }])
+    return len(logs.get("result", []))
 
 
-def get_creation_date(address: str) -> str:
-    """Get contract creation block/date"""
-    url = (f"{BSCSCAN_BASE}?module=contract&action=getcontractcreation"
-           f"&contractaddresses={address}&apikey={BSCSCAN_API_KEY}")
-    data = fetch_url(url)
-    if data.get("status") == "1" and data.get("result"):
-        creator_info = data["result"][0]
-        return creator_info.get("contractCreator", "Unknown"), creator_info.get("txHash", "")
+def get_creation_date(address: str) -> tuple:
+    """Try Sourcify for creator info"""
+    check_url = f"{SOURCIFY_BASE}/check-by-addresses?addresses={address}&chainIds=56"
+    check = fetch_url(check_url)
+    if isinstance(check, list) and check:
+        creator = check[0].get("storageTimestamp", "")
+        if creator:
+            return "via Sourcify", ""
     return "Unknown", ""
 
 
@@ -129,11 +199,11 @@ def calculate_risk_score(
     elif holder_count < 1000:
         score += 5
 
-    # Transaction activity
+    # Transaction activity (based on recent Transfer events ~5h)
     if tx_count < 10:
         score += 15
-    elif tx_count < 50:
-        score += 8
+    elif tx_count < 100:
+        score += 5
 
     # Age
     if age_days < 3:
@@ -242,7 +312,7 @@ def scan_contract(address: str):
     print(f"  合约名称:   {contract_name}")
     print(f"  编译器版本: {compiler_version}")
     print(f"  持币地址数: {holder_count:,}" if holder_count else f"  持币地址数: 暂无数据")
-    print(f"  总交易数:   {tx_count:,}")
+    print(f"  近5小时Transfer: {tx_count:,} 笔")
     print(f"  创建者:     {creator[:10]}..." if len(creator) > 10 else f"  创建者:     {creator}")
 
     print(f"\n🔐 安全检查")
@@ -285,28 +355,17 @@ def check_wallet(address: str):
     print(f"🔗 BSCScan: https://bscscan.com/address/{address}")
     print("━" * 55)
 
-    # Get BNB balance
-    balance_url = (f"{BSCSCAN_BASE}?module=account&action=balance"
-                   f"&address={address}&apikey={BSCSCAN_API_KEY}")
-    balance_data = fetch_url(balance_url)
+    # Get BNB balance via RPC
+    balance_data = rpc_call("eth_getBalance", [address, "latest"])
     bnb_balance = 0.0
-    if balance_data.get("status") == "1":
-        try:
-            bnb_balance = int(balance_data["result"]) / 1e18
-        except (ValueError, TypeError):
-            pass
+    try:
+        bnb_balance = int(balance_data.get("result", "0x0"), 16) / 1e18
+    except (ValueError, TypeError):
+        pass
 
-    # Get recent transactions
-    tx_url = (f"{BSCSCAN_BASE}?module=account&action=txlist"
-              f"&address={address}&sort=desc&offset=10&page=1"
-              f"&apikey={BSCSCAN_API_KEY}")
-    tx_data = fetch_url(tx_url)
-
-    # Get token transactions
-    token_url = (f"{BSCSCAN_BASE}?module=account&action=tokentx"
-                 f"&address={address}&sort=desc&offset=20&page=1"
-                 f"&apikey={BSCSCAN_API_KEY}")
-    token_data = fetch_url(token_url)
+    # No tx list available via free RPC without indexer; leave empty
+    tx_data = {"status": "0"}
+    token_data = {"status": "0"}
 
     # Get BNB price for USD conversion
     bnb_price_data = fetch_url("https://api.binance.com/api/v3/ticker/price?symbol=BNBUSDT")

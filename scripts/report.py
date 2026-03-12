@@ -17,14 +17,34 @@ if sys.platform == "win32":
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 
-BSCSCAN_API_KEY = os.environ.get("BSCSCAN_API_KEY", "YourApiKeyToken")
 UTC8 = timezone(timedelta(hours=8))
+BSC_RPC = "https://bsc-rpc.publicnode.com"
+
+
+def _make_opener():
+    # Use direct connection; TUN-mode VPN routes traffic at OS level
+    return urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+_opener = _make_opener()
+
+
+def rpc_call(method: str, params: list) -> dict:
+    payload = json.dumps({"jsonrpc": "2.0", "method": method, "params": params, "id": 1}).encode()
+    req = urllib.request.Request(
+        BSC_RPC, data=payload,
+        headers={"Content-Type": "application/json", "User-Agent": "BinanceSentinel/1.0"}
+    )
+    try:
+        with _opener.open(req, timeout=15) as resp:
+            return json.loads(resp.read().decode())
+    except Exception as e:
+        return {"error": str(e)}
 
 
 def fetch_url(url: str) -> dict | list:
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "BinanceSentinel/1.0"})
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with _opener.open(req, timeout=15) as resp:
             return json.loads(resp.read().decode())
     except Exception as e:
         return {"error": str(e)}
@@ -99,14 +119,10 @@ def get_top_movers(n: int = 5) -> tuple:
 
 
 def get_gas_price() -> str:
-    url = (f"https://api.bscscan.com/api?module=gastracker&action=gasoracle"
-           f"&apikey={BSCSCAN_API_KEY}")
-    data = fetch_url(url)
-    if data.get("status") == "1" and data.get("result"):
-        r = data["result"]
-        return f"🟢 SafeLow: {r.get('SafeGasPrice', '?')} Gwei | " \
-               f"🟡 Standard: {r.get('ProposeGasPrice', '?')} Gwei | " \
-               f"🔴 Fast: {r.get('FastGasPrice', '?')} Gwei"
+    data = rpc_call("eth_gasPrice", [])
+    if "result" in data:
+        gwei = int(data["result"], 16) / 1e9
+        return f"当前 Gas: {gwei:.1f} Gwei  (数据源: BSC RPC)"
     return "Gas数据暂时不可用"
 
 
