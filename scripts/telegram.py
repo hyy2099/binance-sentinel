@@ -54,7 +54,10 @@ _opener = _make_opener()
 
 def fetch_url(url: str, data: bytes = None) -> dict:
     try:
-        req = urllib.request.Request(url, data=data, headers={"User-Agent": "BinanceSentinel/1.0"})
+        headers = {"User-Agent": "BinanceSentinel/1.0"}
+        if data:
+            headers["Content-Type"] = "application/json"
+        req = urllib.request.Request(url, data=data, headers=headers)
         with _opener.open(req, timeout=15) as resp:
             return json.loads(resp.read().decode())
     except Exception as e:
