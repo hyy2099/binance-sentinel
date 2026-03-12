@@ -18,6 +18,27 @@ if sys.platform == "win32":
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 
 UTC8 = timezone(timedelta(hours=8))
+
+def _load_dotenv():
+    """Auto-load .env from script dir or parent dir"""
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    for path in [os.path.join(script_dir, '.env'),
+                 os.path.join(os.path.dirname(script_dir), '.env')]:
+        if os.path.exists(path):
+            with open(path, encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith('#') or '=' not in line:
+                        continue
+                    key, _, val = line.partition('=')
+                    key = key.strip()
+                    val = val.strip().strip('"').strip("'")
+                    if key and key not in os.environ:
+                        os.environ[key] = val
+            break
+
+_load_dotenv()
+
 BSC_RPC = "https://bsc-rpc.publicnode.com"
 
 
