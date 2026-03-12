@@ -376,6 +376,15 @@ def check_wallet(address: str):
     print(f"🔗 BSCScan: https://bscscan.com/address/{address}")
     print("━" * 55)
 
+    TRANSFER_TOPIC  = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+    APPROVAL_TOPIC  = "0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925"
+    addr_topic = "0x" + "0" * 24 + address[2:].lower()
+
+    # Get latest block
+    blk = rpc_call("eth_blockNumber", [])
+    latest = int(blk.get("result", "0x0"), 16)
+    from_block = latest - 6000  # ~5 hours
+
     # Get BNB balance via RPC
     balance_data = rpc_call("eth_getBalance", [address, "latest"])
     bnb_balance = 0.0
@@ -384,47 +393,72 @@ def check_wallet(address: str):
     except (ValueError, TypeError):
         pass
 
-    # No tx list available via free RPC without indexer; leave empty
-    tx_data = {"status": "0"}
-    token_data = {"status": "0"}
-
-    # Get BNB price for USD conversion
+    # Get BNB price
     bnb_price_data = fetch_url("https://api.binance.com/api/v3/ticker/price?symbol=BNBUSDT")
     bnb_price = float(bnb_price_data.get("price", 300))
+
+    # Get recent incoming token transfers
+    in_logs = rpc_call("eth_getLogs", [{"fromBlock": hex(from_block), "toBlock": "latest",
+        "topics": [TRANSFER_TOPIC, None, addr_topic]}]).get("result", [])
+
+    # Get recent outgoing token transfers
+    out_logs = rpc_call("eth_getLogs", [{"fromBlock": hex(from_block), "toBlock": "latest",
+        "topics": [TRANSFER_TOPIC, addr_topic, None]}]).get("result", [])
+
+    # Get token approvals (授权记录)
+    approval_logs = rpc_call("eth_getLogs", [{"fromBlock": "0x" + hex(latest - 100000)[2:],
+        "toBlock": "latest",
+        "topics": [APPROVAL_TOPIC, addr_topic]}]).get("result", [])
 
     print(f"\n💰 资产概览")
     print(f"  BNB余额: {bnb_balance:.4f} BNB (≈ ${bnb_balance * bnb_price:,.2f} USD)")
 
-    # Recent transactions summary
-    if tx_data.get("status") == "1" and tx_data.get("result"):
-        txs = tx_data["result"]
-        print(f"\n📊 最近交易记录 (最新{min(5, len(txs))}笔):")
-        for tx in txs[:5]:
-            ts = int(tx.get("timeStamp", "0"))
-            dt = datetime.fromtimestamp(ts, tz=UTC8).strftime("%m-%d %H:%M")
-            direction = "📤 OUT" if tx["from"].lower() == address.lower() else "📥 IN"
-            value = int(tx.get("value", "0")) / 1e18
-            status = "✅" if tx.get("txreceipt_status") == "1" else "❌"
-            print(f"  {status} {dt} {direction} {value:.4f} BNB | {tx['hash'][:10]}...")
+    # Recent token transfers
+    all_transfers = in_logs + out_logs
+    tokens_seen = {}
+    for log in all_transfers:
+        contract = log.get("address", "").lower()
+        if contract not in tokens_seen:
+            tokens_seen[contract] = {"in": 0, "out": 0}
+        topics = log.get("topics", [])
+        if len(topics) > 1 and topics[1].endswith(address[2:].lower()):
+            tokens_seen[contract]["out"] += 1
+        else:
+            tokens_seen[contract]["in"] += 1
 
-    # Token holdings
-    if token_data.get("status") == "1" and token_data.get("result"):
-        tokens_seen = {}
-        for tx in token_data["result"]:
-            symbol = tx.get("tokenSymbol", "?")
-            if symbol not in tokens_seen:
-                tokens_seen[symbol] = tx.get("contractAddress", "")
+    if tokens_seen:
+        print(f"\n🪙 近5小时代币交互 ({len(tokens_seen)} 种):")
+        for contract, counts in list(tokens_seen.items())[:10]:
+            print(f"  • {contract[:6]}...{contract[-4:]}  📥入{counts['in']} 📤出{counts['out']}")
+    else:
+        print(f"\n🪙 近5小时无代币转账记录")
 
-        if tokens_seen:
-            print(f"\n🪙 近期交互代币 ({len(tokens_seen)}种):")
-            for symbol, addr in list(tokens_seen.items())[:10]:
-                print(f"  • {symbol}: {addr[:6]}...{addr[-4:]}")
+    # Token approvals
+    print(f"\n⚠️  代币授权记录 (近10万区块 ~3.5天):")
+    if approval_logs:
+        approved_contracts = {}
+        for log in approval_logs:
+            contract = log.get("address", "").lower()
+            topics = log.get("topics", [])
+            spender = ("0x" + topics[2][-40:]) if len(topics) > 2 else "unknown"
+            amount_hex = log.get("data", "0x0")
+            try:
+                amount = int(amount_hex, 16)
+                unlimited = amount > 10**30
+            except Exception:
+                unlimited = False
+            approved_contracts[contract] = {"spender": spender, "unlimited": unlimited}
+
+        for contract, info in list(approved_contracts.items())[:10]:
+            risk = "🔴 无限授权" if info["unlimited"] else "🟡 有限授权"
+            print(f"  {risk}  合约: {contract[:6]}...{contract[-4:]}  授权给: {info['spender'][:6]}...{info['spender'][-4:]}")
+        print(f"\n  💡 建议撤销不再使用的授权 → https://revoke.cash")
+    else:
+        print(f"  ✅ 未发现授权记录")
 
     print(f"\n🔐 安全提醒")
     print(f"  ✅ 该工具仅读取公开链上数据，不会访问私钥")
-    print(f"  ⚠️  定期检查并撤销不必要的代币授权")
-    print(f"  🔗 撤销授权工具: https://revoke.cash")
-    print(f"  🔗 更多授权检查: https://bscscan.com/tokenapprovalchecker")
+    print(f"  🔗 完整授权检查: https://bscscan.com/tokenapprovalchecker")
 
     print("\n━" * 55)
     print("🛡️ 链哨 · BinanceSentinel — Read-Only Wallet Analysis")
